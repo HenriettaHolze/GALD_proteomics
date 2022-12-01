@@ -1,0 +1,608 @@
+---
+title: "GALD fetal liver tissue"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+```{r}
+library(tidyverse)
+library(limma)
+library(broom)
+library(ggrepel)
+library(ggpubr)
+library(openxlsx)
+```
+
+Read in MaxQuant search results.
+
+```{r}
+proteinGroups <- read_tsv("../data/20201126/proteinGroups.txt")
+
+infoCols <- colnames(proteinGroups[c(1:12, 124:131, 358:370)])
+```
+
+Load experimental overview with file and sample names.
+
+```{r}
+expOverview <- readxl::read_excel("../data/experimental_overview_manuscript.xlsx", sheet = "experimental_design_fetal_liver")
+expOverview
+```
+Design matrix. 
+
+CP: PBC plasma
+CN: healthy plasma
+S: GALD plasma
+
+```{r}
+design <- expOverview %>%
+  mutate(file=str_remove(Name, ".raw$")) %>%
+  mutate(file=str_remove(file, "^20")) %>%
+  select(file, sample, condition, IP) %>%
+  mutate(plasma = ifelse(condition == "CP", "PBC", ifelse(condition == "CN", "healthy", ifelse(condition=="S", "GALD", "O")))) %>%
+  mutate(plasma = factor(plasma, levels = c("GALD", "healthy", "PBC", "O")))
+
+design
+```
+
+Rename columns
+
+```{r}
+proteinColnames <- names(proteinGroups)
+for (i in seq(dim(design)[1])) {
+  proteinColnames <- gsub(paste0(design$file[i], "\\b"), design$sample[i], proteinColnames)
+}
+
+colnames(proteinGroups) <- proteinColnames
+```
+
+Fill in majority Protein IDs for gene names if they are missing. 
+
+```{r}
+proteinGroups$`Gene names` <- ifelse(is.na(proteinGroups$`Gene names`), proteinGroups$`Majority protein IDs`, proteinGroups$`Gene names`)
+```
+
+## QC
+
+Filter out contaminants and matched to the decoy database.  
+Remove protein groups that were identified with no unique peptide. 
+
+```{r}
+proteinGroups <- proteinGroups %>%
+                   filter(is.na(`Potential contaminant`), 
+                          is.na(Reverse),
+                          `Unique peptides` != 0)
+```
+
+Cound how many proteins were identified and quantified in each IP.
+
+```{r}
+# sum over unique peptides 
+proteinGroups %>%
+  select(`Protein IDs`, starts_with("Unique peptides ")) %>%
+  pivot_longer(cols = starts_with("Unique peptides "), names_to = "sample", values_to = "Unique peptides") %>%
+  mutate(sample = str_remove(sample, "Unique peptides ")) %>%
+  merge(expOverview, by.y="sample") %>%
+  filter(`Unique peptides` != 0) %>%
+  # remove redundancy within IPs
+  distinct(`Protein IDs`, IP) %>%
+  group_by(IP) %>%
+  summarise("# identified protein groups" = n())
+
+# sum over unique peptides 
+proteinGroups %>%
+  select(`Protein IDs`, starts_with("LFQ intensity ")) %>%
+  pivot_longer(cols = starts_with("LFQ intensity "), names_to = "sample", values_to = "LFQ intensity") %>%
+  mutate(sample = str_remove(sample, "LFQ intensity ")) %>%
+  merge(expOverview, by.y="sample") %>%
+  filter(`LFQ intensity` != 0) %>%
+  # remove redundancy within IPs
+  distinct(`Protein IDs`, IP) %>%
+  group_by(IP) %>%
+  summarise("# quantified protein groups" = n())
+```
+
+
+## Presence/absense
+
+Select best hits based on absense/presence: Protein groups that are absent in controls but present in diseased. 
+
+Based on identification of unique peptides.
+
+For each IP separately. 
+
+```{r}
+abs_pres <- function(IP) {
+  ctrlIntensCols <- pull(design[design$condition == "CN" & design$IP == IP, ], "sample")
+  ctrlIntensCols <- sprintf("Unique peptides %s", ctrlIntensCols)
+  
+  ctrlAbsProteinGroups <- proteinGroups %>%
+    select(`Protein IDs`, `Gene names`, !!!syms(ctrlIntensCols)) %>%
+    rowwise() %>%
+    mutate(ctrlSum = sum(!!!syms(ctrlIntensCols))) %>%
+    filter(ctrlSum == 0) %>%
+    pull(`Protein IDs`)
+
+  diseasedIntensCols <- pull(design[design$condition == "S" & design$IP == IP, ], "sample")
+  diseasedIntensCols <- sprintf("Unique peptides %s", diseasedIntensCols)
+  
+  otherIntensCols <- pull(design[(design$condition == "O" | design$condition == "CP") & design$IP == IP, ], "sample")
+  otherIntensCols <- sprintf("Unique peptides %s", otherIntensCols)
+  
+  rankingAbsPres <- proteinGroups %>%
+    # filter out proteins that were detected in controls
+    filter(`Protein IDs` %in% ctrlAbsProteinGroups) %>%
+    select(!!!syms(infoCols), !!!syms(diseasedIntensCols), !!!syms(otherIntensCols)) %>%
+    # count evidence in GALD samples
+    mutate(across(c(!!!syms(diseasedIntensCols), !!!syms(otherIntensCols)), .fns = list(evidence = ~as.numeric(. != 0)))) %>%
+    rowwise() %>%
+    mutate(evidence = sum(!!!syms(sprintf("%s_evidence", diseasedIntensCols)))) %>%
+    select(-ends_with("_evidence")) %>%
+    arrange(desc(evidence))
+  
+  maxPresence <- max(rankingAbsPres$evidence)
+  
+  topHitsAbsPres <- rankingAbsPres %>%
+    filter(evidence == maxPresence)
+  
+  return(topHitsAbsPres)
+}
+```
+
+
+```{r}
+topHitsAbsPres_IP3 <- abs_pres("IP3")
+topHitsAbsPres_IP2 <- abs_pres("IP2")
+topHitsAbsPres_IP1 <- abs_pres("IP1")
+```
+
+Put best hits into relation: number of unique peptides, 
+
+Size = Unique peptides per run 
+
+```{r}
+plot_abs_pres <- function(topHitsAbsPres, IP) {
+  
+  designSub <- design[design$IP == IP, ]
+  fill_df <- data.frame(matrix(1, ncol=length(designSub$sample), nrow = length(topHitsAbsPres$`Gene names`)))
+  colnames(fill_df) <- designSub$sample
+  fill_df$`Gene names` <- topHitsAbsPres$`Gene names`
+  fill_df <- fill_df %>%
+    pivot_longer(cols=-`Gene names`, names_to = "sample") %>%
+    merge(design, by="sample") %>%
+    filter(condition != "CN") %>%
+    merge(topHitsAbsPres[,c("Unique peptides", "Gene names")]) %>%
+    mutate(gene_info = paste0(`Gene names`, " (", `Unique peptides`, ")"))
+    
+  g <- topHitsAbsPres %>%
+    select(-`Protein IDs`, -evidence) %>%
+    pivot_longer(cols = starts_with("Unique peptides "), values_to = "Unique peptides per run") %>%
+    mutate(sample = str_remove(name, "Unique peptides ")) %>%
+    merge(design, by="sample") %>%
+    mutate(gene_info = paste0(`Gene names`, " (", `Unique peptides`, ")")) %>%
+    filter(`Unique peptides per run` != 0) %>%
+    ggplot(aes(y=gene_info, x=sample)) +
+    geom_point(aes(col=condition, size=as.character(`Unique peptides per run`))) +
+    scale_size_manual(values=c("1" = 3, "2" = 5, "3" = 7)) +
+    geom_line(data=fill_df, aes(y=gene_info, x=sample, group=gene_info), alpha=0.5) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+  return(g)
+}
+
+plot_abs_pres(topHitsAbsPres_IP3, "IP3")
+plot_abs_pres(topHitsAbsPres_IP2, "IP2")
+plot_abs_pres(topHitsAbsPres_IP1 ,"IP1")
+```
+
+
+For each liver age, no protein group was identified that is absent in all samples with healthy plasma and present in all samples with GALD plasma based on identified unique peptides. 
+
+
+## LFQ
+
+Since we didn't find a protein that is absent in controlls and present in all labels, Label free quantification to compare abundance. 
+
+### Normalization
+
+log2 transform LFQ values
+
+```{r}
+proteinGroupsLfq <- proteinGroups %>%
+  select(!!!syms(infoCols), starts_with("LFQ intensity ")) %>%
+  pivot_longer(cols = starts_with("LFQ intensity "), values_to = "LFQ intensity", names_to = "sample") %>%
+  mutate(`LFQ intensity log2` = log2(`LFQ intensity`)) %>%
+  mutate_at(vars(`LFQ intensity log2`), list(~na_if(., -Inf))) %>%
+  mutate(sample = str_remove(sample, "LFQ intensity ")) %>%
+  merge(design, by="sample")
+```
+
+Plot distribution
+
+```{r}
+proteinGroupsLfq %>%
+  filter(condition != "O") %>%
+  ggplot(aes(x = sample, y=`LFQ intensity log2`, fill=plasma)) +
+  geom_boxplot() +
+  ylab("log2 LFQ intensity") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+```
+
+Median normalization
+
+```{r}
+overallMean <- proteinGroupsLfq %>%
+  group_by(sample) %>%
+  summarize(median = median(`LFQ intensity log2`, na.rm = T)) %>%
+  pull(median) %>% mean()
+
+proteinGroupsLfq <- proteinGroupsLfq %>%
+  group_by(sample) %>%
+  mutate(`LFQ intensity log2 norm` = `LFQ intensity log2` - median(`LFQ intensity log2`, na.rm = T) + overallMean)
+
+proteinGroupsLfq %>%
+  filter(condition != "O") %>%
+  ggplot(aes(x = sample, y=`LFQ intensity log2 norm`, fill=plasma)) +
+  geom_boxplot() +
+  ylab("log2 LFQ intensity norm") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+```
+
+Plot Quantification of proteins across IPs. 
+
+```{r}
+plot_lfq_protein <- function(protIDs, name=F) {
+  g <- proteinGroupsLfq %>%
+    filter(`Protein IDs` == protIDs) %>%
+    filter(condition != "O") %>%
+    ggplot(aes(x = plasma, y=`LFQ intensity log2 norm`, col=plasma)) +
+    geom_point(alpha=0.5) +
+    scale_color_manual(values=colorPalette) +
+    facet_grid(~IP) +
+    ylab("log2 LFQ intensity norm") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+  if(name) {
+    g <- g + ggtitle(proteinGroups[proteinGroups$`Protein IDs` == protIDs, "Gene names"])
+  }
+
+  return(g)
+}
+```
+
+
+### PCA
+
+PCA to check if samples can be divided into diseased and controls. 
+
+Replace missing values.
+
+```{r}
+.pcaFetalLiver <- function(lfqCol) {
+  # identify lower 1 percentile 
+  lowerValue <- quantile(proteinGroupsLfq %>%
+                      pull(!!sym(lfqCol)), probs = 0.01, na.rm = T)
+  
+  pcaInput <- proteinGroupsLfq %>% 
+    select(`Protein IDs`, sample, !!sym(lfqCol)) %>%
+    mutate(lfqColRepl = replace_na(!!sym(lfqCol), lowerValue)) %>%
+    select(-!!sym(lfqCol)) %>%
+    pivot_wider(names_from = sample, values_from = lfqColRepl) %>%
+    select(-`Protein IDs`) %>%
+    t()
+  
+  pca.log2 <- prcomp(pcaInput)
+  
+  percent_variance_log2 <-
+    summary(pca.log2)$importance["Proportion of Variance",] * 100
+  
+  plot.log2 <- as_tibble(pca.log2$x) %>%
+    mutate(sample = rownames(pca.log2$x)) %>%
+    merge(design, by="sample")
+  
+  ggplot(plot.log2, aes(
+    x = PC1,
+    y = PC2,
+    color = plasma,
+    shape=IP
+  )) +
+    geom_point() +
+    geom_text_repel(aes(label = sample)) +
+    xlab(label = paste("PC1", percent_variance_log2[1])) +
+    ylab(label = paste("PC2", percent_variance_log2[2])) +
+    theme_bw()
+}
+```
+
+```{r}
+.pcaFetalLiver("LFQ intensity log2")
+```
+
+```{r}
+.pcaFetalLiver("LFQ intensity log2 norm")
+```
+
+
+### Limma 
+
+Filter out proteins that are only in diseased or only in ctrl.
+
+https://bioconductor.org/packages/release/workflows/vignettes/RNAseq123/inst/doc/designmatrices.html
+Section 4.4 Factors
+
+LIMMA in proteomics
+https://academic.oup.com/nar/article/49/W1/W573/6272413?login=true
+
+
+```{r}
+limma_ips <- function(selIP) {
+  # get protein groups for which I can calculate relative abundance
+  proteinGroupsRelativeAbundance <- proteinGroupsLfq %>%
+    # don't consider GRO
+    filter(IP == selIP) %>%
+    filter(condition != "CP", condition != "O") %>%
+    group_by(condition, `Protein IDs`) %>%
+    # in how many samples per group is protein present?
+    summarize(sum = sum(!is.na(`LFQ intensity log2 norm`))) %>%
+    group_by(`Protein IDs`) %>%
+    summarize(sum = sum(sum == 0)) %>%
+    filter(sum == 0) %>%
+    pull(`Protein IDs`)
+
+  limmaInput <- proteinGroupsLfq %>%
+    filter(`Protein IDs` %in% proteinGroupsRelativeAbundance) %>%
+    filter(IP == selIP) %>%
+    filter(condition == "CN" | condition == "S") %>%
+    select(`Protein IDs`, sample, `LFQ intensity log2 norm`) %>%
+    pivot_wider(names_from = sample, values_from = `LFQ intensity log2 norm`) %>%
+    # select columns in the same order as they are in the design matrix
+    select(`Protein IDs`, pull(design[(design$condition == "S" | design$condition == "CN") & design$IP == selIP,], sample)) %>%
+    as.data.frame()
+
+  rownames(limmaInput) <- limmaInput$`Protein IDs`
+  limmaInput <- limmaInput[-1]
+  
+  limmaDesign <- pull(design[(design$condition == "S" | design$condition == "CN") & design$IP == selIP, ], condition)
+  limmaDesign <- model.matrix(~0+limmaDesign)
+  limmaContrasts <- makeContrasts(limmaDesignS-limmaDesignCN, levels=colnames(limmaDesign))
+
+  # Estimate the fold changes and standard errors by fitting a linear model for each gene.
+  fit <- lmFit(limmaInput, limmaDesign)
+  fit <- contrasts.fit(fit, limmaContrasts)
+  
+  # Apply empirical Bayes smoothing to the standard errors.
+  fit <- eBayes(fit)
+    
+  limmaResult <- topTable(fit, n=dim(limmaInput)[1])
+  limmaResult$`Protein IDs` <- rownames(limmaResult)
+  # merge gene names
+  limmaResult <- merge(limmaResult, proteinGroups, by.x = "Protein IDs", by.y = "Protein IDs", all.x = T)
+  
+  return(limmaResult)
+}
+
+```
+
+```{r}
+limmaResultIP1 <- limma_ips("IP1")
+limmaResultIP2 <- limma_ips("IP2")
+limmaResultIP3 <- limma_ips("IP3")
+```
+
+### Limma Volcano plot
+
+
+```{r}
+limmaResultIP1 %>%
+  ggplot(aes(P.Value)) +
+  geom_histogram(binwidth = 0.05, color = "black") +
+  ggtitle("P-value distribution") +
+  theme_bw()
+limmaResultIP2 %>%
+  ggplot(aes(P.Value)) +
+  geom_histogram(binwidth = 0.05, color = "black") +
+  ggtitle("P-value distribution") +
+  theme_bw()
+limmaResultIP3 %>%
+  ggplot(aes(P.Value)) +
+  geom_histogram(binwidth = 0.05, color = "black") +
+  ggtitle("P-value distribution") +
+  theme_bw()
+```
+
+Calculate "artificial" log2FC for protein groups only present in either S or CN but in at least 2 samples. 
+
+
+```{r}
+# color palette from Won https://davidmathlogic.com/colorblind/#%23000000-%23E69F00-%2356B4E9-%23009E73-%23F0E442-%230072B2-%23D55E00-%23CC79A7
+colorPalette <- c("#E69F00", "#009E73", "#0072B2")
+colorPaletteVolcano <- c("#56B4E9", "#D55E00")
+
+volcanoLimma <- function(limmaResult, selIP) {
+
+  # replace missing values with 0.1%ile of that IP (to avoid outlier)
+  lowerValue <- quantile(proteinGroupsLfq %>%
+                      filter(IP == selIP) %>%
+                      filter(condition != "CP", condition != "O") %>%
+                      pull(`LFQ intensity log2 norm`), probs = 0.001, na.rm = T)
+  
+  # calculate FC for proteins only quantified in samples or controls
+  lfgRelFake <- proteinGroupsLfq %>%
+    filter(!(`Protein IDs` %in% limmaResult$`Protein IDs`)) %>%
+    filter(IP == selIP) %>%
+    filter(condition != "CP", condition != "O") %>%
+    group_by(condition, `Protein IDs`) %>%
+    summarize(mean = mean(`LFQ intensity log2 norm`, na.rm=T), evidence = sum(!is.na(`LFQ intensity log2 norm`))) %>%
+    mutate(mean = replace_na(mean, lowerValue)) %>%
+    pivot_wider(names_from = condition, values_from = c(mean, evidence)) %>%
+    mutate(evidence = evidence_CN + evidence_S, CN = mean_CN, S = mean_S) %>%
+    filter(evidence > 1) %>%
+    mutate(log2FC = S - CN, presence = ifelse(S == lowerValue, "CN", "S")) %>%
+    merge(select(proteinGroups, !!!syms(infoCols)))
+  
+  # ensure symmetrical limits, so that 0 is aligned
+  xlim1 <- c(-max(abs(limmaResult$logFC), na.rm = T), max(abs(limmaResult$logFC), na.rm = T))
+  xlim2 <- c(-max(abs(lfgRelFake$log2FC), na.rm = T), max(abs(lfgRelFake$log2FC), na.rm = T))
+    
+  g2 <- lfgRelFake %>% 
+    ggplot(aes(x=log2FC, y=0, label = `Gene names`)) +
+    geom_vline(xintercept = 0,
+               alpha = 0.75,
+               linetype = "dashed") +
+    geom_point(alpha=0.5) +
+    coord_cartesian(clip = "off") +
+    geom_text_repel(data = head(lfgRelFake %>% arrange(desc(log2FC)), 5), 
+                    max.overlaps = Inf, 
+                    nudge_y = -0.5
+                    # ylim = c(-Inf, Inf)
+                    ) +
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(),
+      panel.border = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.text.x = element_blank()
+    ) +
+    xlim(xlim2) +
+    scale_y_continuous(breaks = c(-1, 0, 1), limits = c(-0.8, 0.1)) +
+    ylab(" ") +
+    xlab("")
+  
+  g1 <- ggplot(limmaResult,
+         aes(
+           x = logFC,
+           y = -log10(P.Value),
+           color = adj.P.Val < 0.05,
+           label = `Gene names`
+         )) +
+    geom_point(alpha = 0.5, size = 1) +
+    scale_color_manual(values=colorPaletteVolcano) +
+    geom_vline(xintercept = 0,
+               alpha = 0.75,
+               linetype = "dashed") +
+    geom_text_repel(data = filter(limmaResult, adj.P.Val < 0.1 | abs(logFC) > 2),
+                    box.padding = 0.2) +
+    xlim(xlim1) +
+    ylim(c(0, 3.7)) +
+    theme_bw() +
+    theme(legend.position = "none") +
+    xlab("log2FC")
+
+  g <- ggarrange(g1, g2, heights = c(5, 2), nrow=2)
+  return(g)
+}
+```
+
+
+```{r}
+g1 <- volcanoLimma(limmaResultIP1, "IP1")
+g2 <- volcanoLimma(limmaResultIP2, "IP2")
+g3 <- volcanoLimma(limmaResultIP3, "IP3")
+```
+
+
+```{r}
+topHitsLimmaIP1 <- limmaResultIP1 %>%
+  filter(adj.P.Val < 0.1 | abs(logFC) > 2) %>%
+  arrange(P.Value)
+
+topHitsLimmaIP2 <- limmaResultIP2 %>%
+  filter(adj.P.Val < 0.1 | abs(logFC) > 2) %>%
+  arrange(P.Value)
+
+topHitsLimmaIP3 <- limmaResultIP3 %>%
+  filter(adj.P.Val < 0.05) %>%
+  arrange(P.Value)
+
+topHitsLimmaIP1 %>%
+  select(`Protein IDs`, `Gene names`, `Protein names`,  P.Value, adj.P.Val, logFC, `Unique peptides`)
+
+topHitsLimmaIP2 %>%
+  select(`Protein IDs`, `Gene names`, `Protein names`,  P.Value, adj.P.Val, logFC, `Unique peptides`)
+
+topHitsLimmaIP3 %>%
+  select(`Protein IDs`, `Gene names`, `Protein names`,  P.Value, adj.P.Val, logFC, `Unique peptides`)
+
+
+g4 <- plot_lfq_protein(pull(topHitsLimmaIP3, `Protein IDs`)[1]) + theme(legend.position = "none")
+g4
+plot_lfq_protein(pull(topHitsLimmaIP3, `Protein IDs`)[2], name = T)
+plot_lfq_protein(pull(topHitsLimmaIP1, `Protein IDs`)[1], name = T)
+plot_lfq_protein(pull(topHitsLimmaIP2, `Protein IDs`)[1], name = T)
+```
+
+
+```{r}
+g <- ggarrange(g1, g2, g3, g4, labels = c("A", "B", "C", "D"))
+# ggsave(g, filename="../plots/fetal_liver_limma_volcano.png", width = 10, height = 7)
+# ggsave(g, filename="../plots/fetal_liver_limma_volcano.pdf", width = 10, height = 7)
+g
+```
+
+
+## Positive control
+
+List of antigens from manuscript.
+
+All 6 identified.
+
+```{r}
+PbcAntigens <- proteinGroups %>%
+  filter(grepl("P10515|P09622|P11177|P08559|O00330|O60232", `Protein IDs`)) %>%
+  pull(`Protein IDs`)
+
+PbcAntigens
+```
+
+```{r}
+g <- lapply(PbcAntigens, function(x) plot_lfq_protein(x, name=T) + theme(legend.position = "none"))
+
+g<- ggarrange(plotlist = g)
+
+# ggsave(g, filename = "../plots/fetal_liver_PBC_antigens_indiv.pdf", width = 6, height=4)
+# ggsave(g, filename = "../plots/fetal_liver_PBC_antigens_indiv.png", width = 6, height=4)
+g
+```
+
+### Suppl. excel sheet
+
+```{r}
+suplExcel <- proteinGroupsLfq %>%
+  select(`Protein IDs`, sample, `LFQ intensity log2`, `LFQ intensity log2 norm`) %>%
+  pivot_wider(
+    names_from = sample,
+    values_from = c(`LFQ intensity log2`, `LFQ intensity log2 norm`),
+    names_sep = " ",
+  )
+
+# remove 2 columns because too long entries for excel and require access to other tables
+tmp <- select(proteinGroups, -c(`Evidence IDs`, `MS/MS IDs`))
+suplExcel <- merge(tmp, suplExcel, by.x = "Protein IDs", by.y="Protein IDs")
+
+limmaResultIP1$IP <- "IP1"
+limmaResultIP2$IP <- "IP2"
+limmaResultIP3$IP <- "IP3"
+
+limmaSupl <- bind_rows(limmaResultIP1, limmaResultIP2, limmaResultIP3) %>%
+  select(`Protein IDs`, IP, logFC, AveExpr, t, P.Value, adj.P.Val, B) %>%
+  pivot_wider(
+    names_from = IP,
+    values_from = c(logFC, AveExpr, t, P.Value, adj.P.Val, B),
+    names_sep = " ",
+  )
+
+suplExcel <- merge(suplExcel, limmaSupl, by="Protein IDs")
+
+# write.xlsx(suplExcel, file = "../outputs/fetal_liver_MS_results.xlsx")
+```
+
+
+
+```{r}
+sessionInfo()
+```
+

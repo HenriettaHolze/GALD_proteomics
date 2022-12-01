@@ -1,0 +1,417 @@
+---
+title: "GALD liver cell line"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+```{r}
+library(tidyverse)
+library(limma)
+library(broom)
+library(ggrepel)
+library(preprocessCore)
+library(ggpubr)
+library(openxlsx)
+```
+
+Differential abundance analysis in MS data from immunoprecipitations from IPs with healthy and GALD plasma. 
+Plasma from a patient with primary biliary cirrhosis (PBC) serves as positive control. 
+
+```{r}
+proteinGroups <- read_tsv("../data/20210104/proteinGroups.txt")
+proteinGroups
+```
+
+Design matrix
+
+```{r}
+expOverview <- readxl::read_excel("../data/experimental_overview_manuscript.xlsx", sheet = "experimental_design_Huh-7")
+design <- expOverview[, c("sample", "condition")]
+design$condition <- factor(design$condition, levels = c("GALD", "healthy", "PBC"))
+design
+```
+
+## QC
+
+Filter out contaminants and matches to the decoy database.  
+Remove protein groups that were identified with no unique peptide. 
+
+```{r}
+proteinGroups <- proteinGroups %>%
+  filter(is.na(`Potential contaminant`),
+         is.na(Reverse),
+         `Unique peptides` != 0)
+```
+
+## Quantile Normalization
+
+Rename labels into sample names and count identified proteins.
+
+```{r}
+# replace labels in column names with sample names
+proteinColnames <- names(proteinGroups)
+for (i in seq(dim(expOverview)[1])) {
+  proteinColnames <- gsub(
+    paste0(" ", expOverview$label[i], " "),
+    paste0(" ", expOverview$sample[i], " "),
+    proteinColnames
+  )
+}
+
+colnames(proteinGroups) <- proteinColnames
+
+intensColNames <- colnames(proteinGroups)[startsWith(colnames(proteinGroups), "Reporter intensity corrected")]
+
+numQuantifiedProteins <- proteinGroups %>%
+  rowwise() %>%
+  mutate(sum_intensities = sum(!!!syms(intensColNames))) %>%
+  filter(sum_intensities != 0) %>%
+  dim()
+
+cat("# identified protein groups", dim(proteinGroups)[1], "\n")
+cat("# quantified protein groups", numQuantifiedProteins[1])
+```
+
+
+## Data transformation and normalization
+
+Log2 transform intensities.
+
+```{r}
+intensLog2ColNames <- paste0(intensColNames, "_log2")
+
+proteinGroups <- proteinGroups %>%
+  mutate(across(c(!!!syms(intensColNames)), .fns = list(log2 = ~(log2(.))))) %>%
+  # replace -Inf with NA
+  mutate_at(vars(intensLog2ColNames), list(~na_if(., -Inf)))
+```
+
+
+Plot corrected intensities before normalization.
+
+```{r}
+plot_intensities <- function(proteinGroups, colNames) {
+  proteinGroups %>%
+    select(`Protein IDs`, colNames) %>%
+    pivot_longer(cols = -`Protein IDs`) %>%
+    rowwise() %>%
+    mutate(sample = strsplit(name, split = " ")[[1]][4]) %>%
+    ggplot(aes(x = sample, y = value)) +
+    geom_violin() +
+    theme_bw() +
+    theme(axis.text.x = element_text(
+      angle = 90,
+      vjust = 0.5,
+      hjust = 1
+    ))
+}
+
+plot_intensities(proteinGroups, intensLog2ColNames) +
+  ylab("log2 Reporter intensity corrected")
+```
+
+Apply quantile normalization.
+
+```{r}
+# perform quantile normalization
+proteinGroupsIntensLog2Norm <- as.data.frame(normalize.quantiles(as.matrix(select(proteinGroups, intensLog2ColNames))))
+# add column and row names back
+proteinGroupsIntensLog2Norm <- as_tibble(add_column(proteinGroupsIntensLog2Norm, 
+                                                    Protein_IDs=proteinGroups$`Protein IDs`, 
+                                                    .before="V1"))
+intensLog2NormColNames <- paste0(intensLog2ColNames, "_norm")
+colnames(proteinGroupsIntensLog2Norm) <- c("Protein IDs", intensLog2NormColNames)
+
+# combine with other table
+proteinGroups <- merge(proteinGroups, proteinGroupsIntensLog2Norm, by="Protein IDs")
+```
+
+Plot after quantile normalization.
+
+```{r}
+plot_intensities(proteinGroups, intensLog2NormColNames) +
+  ylab("log2 normalized Reporter intensity corrected")
+```
+
+## PCA
+
+PCA to check if samples can be separated into diseased and controls.
+
+```{r}
+# color palette from Won https://davidmathlogic.com/colorblind/#%23000000-%23E69F00-%2356B4E9-%23009E73-%23F0E442-%230072B2-%23D55E00-%23CC79A7
+colorPalette <- c("#E69F00", "#009E73", "#0072B2")
+colorPaletteVolcano <- c("#56B4E9", "#D55E00")
+
+plot_pca <- function(proteinGroups, colNames) {
+  pca.log2 <- proteinGroups %>%
+    select(colNames) %>%
+    drop_na() %>%
+    t() %>%
+    prcomp()
+  
+  percent_variance_log2 <-
+    summary(pca.log2)$importance["Proportion of Variance", ] * 100
+  
+  plot.log2 <- as_tibble(pca.log2$x) %>%
+    mutate(Sample = rownames(pca.log2$x),
+           Condition = design$condition)
+  
+  ggplot(plot.log2, aes(x = PC1,
+                        y = PC2,
+                        color = Condition)) +
+    geom_point() +
+    scale_color_manual(values = colorPalette) +
+    xlab(label = paste0("PC1 (", round(percent_variance_log2[1], 2), "% variance)")) +
+    ylab(label = paste0("PC2 (", round(percent_variance_log2[2], 2), "% variance)")) +
+    theme_bw()
+}
+
+plot_pca(proteinGroups, intensLog2ColNames)
+```
+
+
+```{r}
+g <- plot_pca(proteinGroups, intensLog2NormColNames)
+
+# ggsave(g, filename = "../plots/cell_line_pca_norm.pdf", width = 4, height = 2.5)
+# ggsave(g, filename = "../plots/cell_line_pca_norm.png", width = 4, height = 2.5)
+g
+```
+
+After quantile normalization, PCA separates GALD samples, negative controls and the positive control on PC1 and PC2. 
+
+```{r}
+plot_proteins <- function(selected_Protein_IDs, unique_peptides=T) {
+
+  proteinGroupsPlotting <- proteinGroupsIntensLog2Norm %>%
+    merge(proteinGroups[, c("Protein IDs", "Gene names", "Unique peptides")], by = "Protein IDs", all.x = T) %>%
+    pivot_longer(cols = intensLog2NormColNames, values_to = "log2_intens") %>%
+    rowwise() %>%
+    mutate(sample = strsplit(name, split=" ")[[1]][4]) %>%
+    merge(design, by="sample") %>%
+    mutate(gene_info = paste0(`Gene names`, " (", `Unique peptides`, ")"))
+
+  plot_data <- proteinGroupsPlotting %>%
+    filter(`Protein IDs` %in% selected_Protein_IDs) %>%
+    group_by(`Protein IDs`) %>%
+    mutate(log2_intens_aligned = log2_intens - median(log2_intens)) %>%
+    arrange(match(`Protein IDs`, selected_Protein_IDs))
+  
+  if (unique_peptides) {
+    gene_levels <- unique(plot_data$gene_info)
+    g <- proteinGroupsPlotting %>%
+      filter(`Protein IDs` %in% selected_Protein_IDs) %>%
+      mutate(gene_info = factor(gene_info, levels = gene_levels)) %>%
+      ggplot(aes(x=condition, y=log2_intens, color=condition)) +
+      geom_point(alpha=0.5) +
+      facet_wrap(~gene_info, scales="free_y")
+  } else {
+    gene_levels <- unique(plot_data$`Gene names`)
+    g <- proteinGroupsPlotting %>%
+      filter(`Protein IDs` %in% selected_Protein_IDs) %>%
+      mutate(`Gene names` = factor(`Gene names`, levels = gene_levels)) %>%
+      ggplot(aes(x=condition, y=log2_intens, color=condition)) +
+      geom_point(alpha=0.5) +
+      facet_wrap(~`Gene names`, scales="free_y")
+  }
+  
+  g <- g +
+    scale_color_manual(values=colorPalette) +
+    theme_bw() +
+    theme(legend.position = "none") +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+    ylab("normalized log2 intensity")
+
+  return(g)
+}
+```
+
+## Limma analysis for differentially abundant protein groups
+
+```{r}
+# prepare input for limma
+# clean column names
+proteinColnames <- names(proteinGroupsIntensLog2Norm)
+for (i in seq(dim(expOverview)[1])) {
+  proteinColnames <- gsub(
+    paste0(".*", expOverview$sample[i], ".*"),
+    paste0(expOverview$sample[i]),
+    proteinColnames
+  )
+}
+
+limmaInput <- proteinGroupsIntensLog2Norm
+colnames(limmaInput) <- proteinColnames
+
+# exclude positive control from analysis
+limmaInput <- limmaInput %>%
+  select(-PBC) %>%
+  as.data.frame()
+
+# turn column with protein IDs into rownames
+rownames(limmaInput) <- limmaInput$`Protein IDs`
+limmaInput <- limmaInput[2:8]
+
+# design matrix and contrast
+limmaDesign <- as.character(pull(design[design$sample != "PBC",], condition))
+limmaDesign <- model.matrix( ~ 0 + limmaDesign)
+limmaContrasts <- makeContrasts(limmaDesignGALD - limmaDesignhealthy,
+                                levels = colnames(limmaDesign))
+
+# fit limma model
+fit <- lmFit(limmaInput, limmaDesign)
+fit <- contrasts.fit(fit, limmaContrasts)
+fit <- eBayes(fit)
+```
+
+Merge limma results with protein groups table from MaxQuant. 
+
+```{r}
+limmaResult <- topTable(fit, n = dim(proteinGroupsIntensLog2Norm)[1])
+limmaResult$`Protein IDs` <- rownames(limmaResult)
+# merge gene names
+limmaResult <- merge(limmaResult,
+                     proteinGroups,
+                     by = "Protein IDs",
+                     all.x = T)
+```
+
+### Limma p-value distribution
+
+Usually expected to be uniform but since this is from IPs with fewer proteins it is not the case here. 
+
+```{r}
+limmaResult %>%
+  ggplot(aes(P.Value)) +
+  geom_histogram(binwidth = 0.05, color = "black") +
+  ggtitle("P-value distribution") +
+  theme_bw()
+```
+
+### Limma Volcano plot
+
+Volcano plot to visualize significant hits. 
+
+```{r}
+gVolcano <- ggplot(limmaResult,
+                   aes(
+                     x = logFC,
+                     y = -log10(P.Value),
+                     color = adj.P.Val < 0.05
+                   )) +
+  geom_point(alpha = 0.5, size = 1) +
+  scale_color_manual(values = colorPaletteVolcano) +
+  geom_vline(xintercept = 0,
+             alpha = 0.75,
+             linetype = "dashed") +
+  geom_text_repel(data = filter(limmaResult, adj.P.Val < 0.05),
+                  aes(label = `Gene names`)) +
+  theme_bw() +
+  theme(legend.position = "none")
+
+# ggsave(gVolcano, filename = "../plots/cell_line_limma_volcano.pdf", width = 6, height = 4)
+# ggsave(gVolcano, filename = "../plots/cell_line_limma_volcano.png", width = 6, height = 4)
+gVolcano
+```
+
+### Limma best hits
+
+Look at proteins that are significantly differentially abundant. 
+
+```{r}
+topHitsProteinIds <- limmaResult %>%
+  filter(adj.P.Val < 0.05) %>%
+  arrange(logFC)
+
+topHitsProteinIds
+  
+gTopHits <- plot_proteins(pull(topHitsProteinIds, `Protein IDs`))
+
+# ggsave(gTopHits, filename = "../plots/cell_line_sign_hits_limma_indiv.pdf", width = 6, height=4)
+# ggsave(gTopHits, filename = "../plots/cell_line_sign_hits_limma_indiv.png", width = 6, height=4)
+gTopHits
+
+proteinGroups %>%
+  filter(`Protein IDs` %in% pull(topHitsProteinIds, `Protein IDs`)) %>%
+  select(`Protein IDs`, `Gene names`, `Unique peptides`)
+
+topHitsLimmaTable <- topHitsProteinIds %>%
+  select(`Majority protein IDs`, `Gene names`, `Protein names`,  P.Value, adj.P.Val, logFC, `Unique peptides`) %>%
+  arrange(logFC)
+
+topHitsLimmaTable
+```
+
+```{r}
+g <- ggarrange(gVolcano, gTopHits, labels = c("A", "B"))
+# ggsave(g, filename = "../plots/cell_line_limma_results.png", width = 8, height = 3.5)
+# ggsave(g, filename = "../plots/cell_line_limma_results.pdf", width = 8, height = 3.5)
+g
+```
+
+## Positive PBC control
+
+List of PBC antigens from manuscript.
+
+Only 5 out of 6: P09622 (Gene name DLD) Dihydrolipoyl dehydrogenase, mitochondrial not detected. 
+
+```{r}
+PbcAntigens <- proteinGroups %>%
+  filter(grepl("P10515|P09622|P11177|P08559|O00330|O60232", `Protein IDs`)) %>%
+  pull(`Protein IDs`)
+
+proteinGroups %>%
+  filter(grepl("P09622", `Protein IDs`)) %>%
+  pull(`Protein IDs`)
+
+proteinGroups %>%
+  filter(grepl("DLD", `Gene names`)) %>%
+  pull(`Protein IDs`)
+
+PbcAntigens
+```
+
+Plot intensities of the antigens. 
+
+```{r}
+g <- plot_proteins(PbcAntigens, unique_peptides = F)
+
+# ggsave(g, filename = "../plots/cell_line_PBC_antigens_indiv.pdf", width = 6, height=4)
+# ggsave(g, filename = "../plots/cell_line_PBC_antigens_indiv.png", width = 6, height=4)
+g
+```
+
+Calculate fold change between PBC patient and average of controls. 
+
+```{r}
+healthyCols <- c("Reporter intensity corrected healthy1 170912_8plex_scx_log2_norm", 
+                 "Reporter intensity corrected healthy2 170912_8plex_scx_log2_norm", 
+                 "Reporter intensity corrected healthy3 170912_8plex_scx_log2_norm")
+
+proteinGroupsIntensLog2Norm %>%
+  filter(`Protein IDs` %in% PbcAntigens) %>%
+  rowwise() %>%
+  mutate(ctrl_mean = mean(!!!syms(healthyCols)),
+         log2FC = `Reporter intensity corrected PBC 170912_8plex_scx_log2_norm` - ctrl_mean)
+```
+
+Save the full results table.
+
+```{r}
+suplTableManuscript <- merge(proteinGroups,
+                             limmaResult[, c("Protein IDs",
+                                             "logFC",
+                                             "AveExpr",
+                                             "t",
+                                             "P.Value",
+                                             "adj.P.Val",
+                                             "B")],
+                             by = "Protein IDs")
+# write.xlsx(suplTableManuscript, file = "../outputs/Huh-7_MS_results.xlsx")
+```
+
+
+```{r}
+sessionInfo()
+```
